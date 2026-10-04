@@ -1045,6 +1045,7 @@ namespace Gpu {
 	vector<Draw::Meter> gpu_meter_vec = {};
 	vector<Draw::Meter> pwr_meter_vec = {};
 	vector<Draw::Meter> enc_meter_vec = {};
+	vector<Draw::Meter> engine_meter_vec = {};
 	vector<string> box = {};
 
     string draw(const gpu_info& gpu, unsigned long index, bool force_redraw, bool data_same) {
@@ -1063,6 +1064,7 @@ namespace Gpu {
 		auto& gpu_meter = gpu_meter_vec[index];
 		auto& pwr_meter = pwr_meter_vec[index];
 		auto& enc_meter = enc_meter_vec[index];
+		auto& engine_meter = engine_meter_vec[index];
 
 		if (force_redraw) redraw[index] = true;
         bool show_temps = gpu.supported_functions.temp_info and (Config::getB("check_temp"));
@@ -1104,7 +1106,9 @@ namespace Gpu {
 			if (gpu.supported_functions.mem_used and gpu.supported_functions.mem_total)
 				mem_used_graph = Draw::Graph{b_width/2 - 2, 2 + 2*(gpu.supported_functions.mem_utilization), "used", safeVal(gpu.gpu_percent, "gpu-vram-totals"s), graph_symbol};
 			if (gpu.supported_functions.encoder_utilization)
-				enc_meter = Draw::Meter{b_width/2 - 10, "cpu"};
+				enc_meter = Draw::Meter{gpu.supported_functions.decoder_utilization ? b_width/2 - 10 : b_width - 12, "cpu"};
+			if (not gpu.engine_utilization.empty())
+				engine_meter = Draw::Meter{b_width/2 - 10, "cpu"};
 		}
 
 
@@ -1153,6 +1157,33 @@ namespace Gpu {
 				+ Theme::g("cpu").at(clamp(gpu.encoder_utilization, 0ll, 100ll)) + rjust(to_string(gpu.encoder_utilization), 4) + Theme::c("main_fg") + '%'
 				+ Theme::c("div_line") + Symbols::v_line + Theme::c("main_fg") + Fx::b + "DEC " + enc_meter(gpu.decoder_utilization)
 				+ Theme::g("cpu").at(clamp(gpu.decoder_utilization, 0ll, 100ll)) + rjust(to_string(gpu.decoder_utilization), 4) + Theme::c("main_fg") + '%';
+			rows_used++;
+		}
+		//? Per-engine meters, two to a row, for a card reporting a breakdown
+		else if (not gpu.engine_utilization.empty()) {
+			const auto& engines = gpu.engine_utilization;
+			for (size_t i = 0; i < engines.size(); i += 2) {
+				out += Mv::to(b_y + rows_used, b_x + 1);
+				for (size_t half = 0; half < 2; half++) {
+					if (i + half >= engines.size()) {
+						//? Pad the empty half so a stale meter cannot survive a redraw
+						out += string(b_width/2 - 1, ' ');
+						break;
+					}
+					const auto& [label, value] = engines[i + half];
+					if (half) out += Theme::c("div_line") + Symbols::v_line;
+					out += Theme::c("main_fg") + Fx::b + ljust(label, 3) + ' ' + engine_meter(value)
+						+ Theme::g("cpu").at(clamp(value, 0ll, 100ll)) + rjust(to_string(value), 4) + Theme::c("main_fg") + '%';
+				}
+				rows_used++;
+			}
+		}
+		//? A single media figure where encode and decode cannot be told apart,
+		//? as on Intel, where one engine class serves both
+		else if (gpu.supported_functions.encoder_utilization) {
+			out += Mv::to(b_y + rows_used, b_x + 1) + Theme::c("main_fg") + Fx::b + "MED " + enc_meter(gpu.encoder_utilization)
+				+ Theme::g("cpu").at(clamp(gpu.encoder_utilization, 0ll, 100ll)) + rjust(to_string(gpu.encoder_utilization), 5) + Theme::c("main_fg") + '%'
+				+ Theme::c("div_line") + Symbols::v_line;
 			rows_used++;
 		}
 
@@ -2390,6 +2421,7 @@ namespace Draw {
 			gpu_meter_vec.resize(shown);
 			pwr_meter_vec.resize(shown);
 			enc_meter_vec.resize(shown);
+			engine_meter_vec.resize(shown);
 			redraw.resize(shown);
 			total_height = 0;
 			for (auto i = 0; i < shown; ++i) {

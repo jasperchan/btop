@@ -68,6 +68,7 @@ tab-size = 4
 	#define class class_
 extern "C" {
 	#include "intel_gpu_top/intel_gpu_top.h"
+	#include "intel_gpu_top/i915_vram.h"
 }
 	#undef class
 
@@ -287,6 +288,14 @@ namespace Gpu {
 	namespace Intel {
 		const char* device = "i915";
 		struct engines *engines = nullptr;
+		//? hwmon node of the card, for temperature and energy. Empty if absent.
+		std::string hwmon_path;
+		//? energy1_input is a microjoule counter; power is its delta over time
+		long long energy_prev = -1;
+		//? /dev/dri render node of the card, for the VRAM query. Empty if absent.
+		std::string render_node;
+		//? Engine classes the card has, parallel to gpu_info::engine_utilization
+		vector<string> engine_classes;
 
 		bool initialized = false;
 		bool init();
@@ -417,7 +426,9 @@ namespace Shared {
 			for (size_t i = 0; i < gpu_b_height_offsets.size(); ++i)
 				gpu_b_height_offsets[i] = gpus[i].supported_functions.gpu_utilization
 					   + gpus[i].supported_functions.pwr_usage
-					   + (gpus[i].supported_functions.encoder_utilization or gpus[i].supported_functions.decoder_utilization)
+					   + (gpus[i].engine_utilization.empty()
+							? (int)(gpus[i].supported_functions.encoder_utilization or gpus[i].supported_functions.decoder_utilization)
+							: (int)((gpus[i].engine_utilization.size() + 1) / 2)) //? two per row
 					   + (gpus[i].supported_functions.mem_total or gpus[i].supported_functions.mem_used)
 						* (1 + 2*(gpus[i].supported_functions.mem_total and gpus[i].supported_functions.mem_used) + 2*gpus[i].supported_functions.mem_utilization);
 		}
@@ -1938,6 +1949,41 @@ namespace Gpu {
 				return false;
 			}
 
+			//? The card's hwmon node exposes temp1_input and energy1_input, which
+			//? the PMU does not carry. On discrete cards RAPL is unavailable, so
+			//? energy1_input is the only power source.
+			{
+				std::error_code ec;
+				const auto hwmon_root = fs::path(gpu_path) / "device" / "hwmon";
+				if (fs::is_directory(hwmon_root, ec)) {
+					for (const auto& entry : fs::directory_iterator(hwmon_root, ec)) {
+						if (ec) break;
+						if (fs::exists(entry.path() / "temp1_input", ec)
+						 or fs::exists(entry.path() / "energy1_input", ec)) {
+							hwmon_path = entry.path().string();
+							break;
+						}
+					}
+				}
+			}
+
+			//? The VRAM query is a DRM ioctl, so it needs the card's render node.
+			//? Integrated graphics have no local memory and expose none.
+			{
+				std::error_code ec;
+				const auto drm_root = fs::path(gpu_path) / "device" / "drm";
+				if (fs::is_directory(drm_root, ec)) {
+					for (const auto& entry : fs::directory_iterator(drm_root, ec)) {
+						if (ec) break;
+						const auto name = entry.path().filename().string();
+						if (name.starts_with("renderD")) {
+							render_node = "/dev/dri/" + name;
+							break;
+						}
+					}
+				}
+			}
+
 			int ret = pmu_init(engines);
 			if (ret) {
 				Logger::warning("Intel GPU: Failed to initialize PMU");
@@ -1982,38 +2028,134 @@ namespace Gpu {
 			if (!initialized) return false;
 
 			if constexpr(is_init) {
+				std::error_code ec;
+				const bool have_temp = not hwmon_path.empty()
+					and fs::exists(fs::path(hwmon_path) / "temp1_input", ec);
+				const bool have_energy = not hwmon_path.empty()
+					and fs::exists(fs::path(hwmon_path) / "energy1_input", ec);
+
+				//? i915 reports local memory only on discrete cards, and `used`
+				//? additionally needs CAP_PERFMON - probe both rather than assume.
+				uint64_t vram_total = 0, vram_used = 0;
+				const bool have_vram = not render_node.empty()
+					and i915_vram_info(render_node.c_str(), &vram_total, &vram_used) == 0
+					and vram_total > 0;
+
 				gpus_slice->supported_functions = {
 					.gpu_utilization = true,
 					.mem_utilization = false,
 					.gpu_clock = true,
 					.mem_clock = false,
-					.pwr_usage = true,
+					.pwr_usage = engines->rapl_fd >= 0 or have_energy,
 					.pwr_state = false,
-					.temp_info = false,
-					.mem_total = false,
-					.mem_used = false,
+					.temp_info = have_temp,
+					.mem_total = have_vram,
+					.mem_used = have_vram and vram_used > 0,
 					.pcie_txrx = false,
-					.encoder_utilization = false,
+					.encoder_utilization = true,
 					.decoder_utilization = false
 				};
 
 				gpus_slice->pwr_max_usage = 10'000; //? 10W
+				//? power1_max is the card's cap in microwatts; scale to milliwatts
+				if (not hwmon_path.empty()) {
+					if (std::ifstream f(fs::path(hwmon_path) / "power1_max"); f.is_open()) {
+						long long cap = 0;
+						if (f >> cap and cap > 0) gpus_slice->pwr_max_usage = cap / 1000;
+					}
+				}
+			}
+
+			if constexpr(is_init) {
+				//? i915 counts each engine instance separately (vcs0, vcs1, ...).
+				//? Group them by class so the box shows render / blit / media /
+				//? enhance / compute the way intel_gpu_top does, rather than one
+				//? row per instance. Fixed here so the box height stays stable.
+				struct { const char* prefix; const char* label; } static constexpr table[] = {
+					{"rcs", "RCS"}, {"bcs", "BCS"}, {"vcs", "VCS"}, {"vecs", "VEC"}, {"ccs", "CCS"},
+				};
+				for (const auto& [prefix, label] : table) {
+					for (unsigned int i = 0; i < engines->num_engines; i++) {
+						const char* name = (&engines->engine)[i].name;
+						if (name and std::string_view{name}.starts_with(prefix)) {
+							engine_classes.emplace_back(prefix);
+							gpus_slice->engine_utilization.emplace_back(label, 0);
+							break;
+						}
+					}
+				}
 			}
 
 			pmu_sample(engines);
 			double t = (double)(engines->ts.cur - engines->ts.prev) / 1e9;
 
-			double max_util = 0;
+			//? vcs* are the media engines. On Intel one engine serves both encode
+			//? and decode, so it is reported under encoder only - vecs* is video
+			//? enhancement (scale, colour convert, deinterlace) and is busy during
+			//? encode as well, so it is not a decode figure. Measured on DG2: a pure
+			//? encode run showed vcs 9.8% alongside vecs 8.0%.
+			double max_util = 0, media_util = 0;
+			for (auto& [label, value] : gpus_slice->engine_utilization) value = 0;
 			for (unsigned int i = 0; i < engines->num_engines; i++) {
 				struct engine *engine = &(&engines->engine)[i];
 				double util = pmu_calc(&engine->busy.val, 1e9, t, 100);
 				if (util > max_util) {
 					max_util = util;
 				}
+				if (!engine->name) continue;
+				const std::string_view name{engine->name};
+				if (name.starts_with("vcs") and util > media_util) {
+					media_util = util;
+				}
+				//? The busiest instance represents its class
+				for (size_t c = 0; c < engine_classes.size(); c++) {
+					if (name.starts_with(engine_classes[c])) {
+						auto& value = gpus_slice->engine_utilization[c].second;
+						value = max(value, (long long)round(util));
+						break;
+					}
+				}
 			}
 			gpus_slice->gpu_percent.at("gpu-totals").push_back((long long)round(max_util));
+			gpus_slice->encoder_utilization = (long long)round(media_util);
+
+			//? Temperature, in millidegrees
+			if (gpus_slice->supported_functions.temp_info) {
+				if (std::ifstream f(fs::path(hwmon_path) / "temp1_input"); f.is_open()) {
+					long long mdeg = 0;
+					if (f >> mdeg) gpus_slice->temp.push_back(mdeg / 1000);
+				}
+			}
+
+			//? Memory info
+			if (gpus_slice->supported_functions.mem_total) {
+				uint64_t total = 0, used = 0;
+				if (i915_vram_info(render_node.c_str(), &total, &used) != 0) {
+					Logger::warning("Intel GPU: Failed to query VRAM");
+					if constexpr(is_init) gpus_slice->supported_functions.mem_total = false;
+					if constexpr(is_init) gpus_slice->supported_functions.mem_used = false;
+				} else {
+					gpus_slice->mem_total = total;
+					if (gpus_slice->supported_functions.mem_used) {
+						gpus_slice->mem_used = used;
+						gpus_slice->gpu_percent.at("gpu-vram-totals").push_back((long long)round((double)used * 100.0 / (double)total));
+					}
+				}
+			}
 
 			double pwr = pmu_calc(&engines->r_gpu.val, 1, t, engines->r_gpu.scale); // in Watts
+			//? RAPL is only opened for integrated graphics. On a discrete card derive
+			//? power from the hwmon microjoule counter instead.
+			if (engines->rapl_fd < 0 and not hwmon_path.empty() and t > 0) {
+				if (std::ifstream f(fs::path(hwmon_path) / "energy1_input"); f.is_open()) {
+					long long uj = 0;
+					if (f >> uj) {
+						if (energy_prev >= 0 and uj >= energy_prev)
+							pwr = (double)(uj - energy_prev) / 1e6 / t;
+						energy_prev = uj;
+					}
+				}
+			}
 			gpus_slice->pwr_usage = (long long)round(pwr * 1000);
 			if (gpus_slice->pwr_usage > gpus_slice->pwr_max_usage)
 				gpus_slice->pwr_max_usage = gpus_slice->pwr_usage;

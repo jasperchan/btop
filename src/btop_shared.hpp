@@ -175,6 +175,10 @@ namespace Gpu {
 		long long encoder_utilization = 0;
 		long long decoder_utilization = 0;
 
+		//? Per-engine utilization, label and percent, for cards that expose a
+		//? breakdown instead of a single encode/decode pair. Empty if unsupported.
+		vector<std::pair<string, long long>> engine_utilization = {};
+
 		gpu_info_supported supported_functions;
 
 		// vector<proc_info> graphics_processes = {}; // TODO

@@ -252,7 +252,7 @@ SOURCES += $(sort $(shell find $(SRCDIR)/$(PLATFORM_DIR) -maxdepth 1 -type f -na
 OBJECTS	:= $(patsubst $(SRCDIR)/%,$(BUILDDIR)/%,$(SOURCES:.$(SRCEXT)=.$(OBJEXT)))
 
 ifeq ($(GPU_SUPPORT)$(INTEL_GPU_SUPPORT),truetrue)
-	IGT_OBJECTS := $(BUILDDIR)/igt_perf.c.o $(BUILDDIR)/intel_device_info.c.o $(BUILDDIR)/intel_name_lookup_shim.c.o $(BUILDDIR)/intel_gpu_top.c.o
+	IGT_OBJECTS := $(BUILDDIR)/igt_perf.c.o $(BUILDDIR)/intel_device_info.c.o $(BUILDDIR)/intel_name_lookup_shim.c.o $(BUILDDIR)/intel_gpu_top.c.o $(BUILDDIR)/i915_vram.c.o
 	OBJECTS += $(IGT_OBJECTS)
 	SHOW_CC_INFO = false
 	CC_VERSION := $(shell $(CC) -dumpfullversion -dumpversion || echo 0)
